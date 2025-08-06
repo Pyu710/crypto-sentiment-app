@@ -27,12 +27,19 @@ SMOOTH_DAYS = 7
 MAX_WEIGHT = 0.7
 
 # ------------------------------ #
-# Data helpers
+# Helpers
 # ------------------------------ #
-@st.cache_data(ttl=1800)
+def _add_api_key(params: dict) -> dict:
+    """Attach CryptoCompare API key only if provided."""
+    if CRYPTOCOMPARE_API_KEY:
+        params = {**params, "api_key": CRYPTOCOMPARE_API_KEY}
+    return params
+
+@st.cache_data(ttl=1800, show_spinner=False)
 def fetch_ohlcv(symbol: str, days: int = LOOKBACK_DAYS) -> pd.DataFrame:
+    """Fetch daily OHLCV (we keep close price as symbol column and volume)."""
     url = "https://min-api.cryptocompare.com/data/v2/histoday"
-    params = {"fsym": symbol, "tsym": VS_CCY, "limit": days, "api_key": CRYPTOCOMPARE_API_KEY}
+    params = _add_api_key({"fsym": symbol, "tsym": VS_CCY, "limit": days})
     r = requests.get(url, params=params, timeout=30)
     r.raise_for_status()
     arr = r.json().get("Data", {}).get("Data", [])
@@ -41,14 +48,12 @@ def fetch_ohlcv(symbol: str, days: int = LOOKBACK_DAYS) -> pd.DataFrame:
     df = pd.DataFrame(arr)
     df["time"] = pd.to_datetime(df["time"], unit="s", utc=True)
     df.set_index("time", inplace=True)
-    # 仅保留收盘价列，命名为币种名；同时保留成交量以备后用
     df.rename(columns={"close": symbol, "volumeto": f"{symbol}_volume"}, inplace=True)
     return df[[symbol, f"{symbol}_volume"]]
 
-@st.cache_data(ttl=1800)
-def fetch_all_prices() -> tuple[pd.DataFrame, pd.DataFrame]:
-    prices = []
-    vols = []
+@st.cache_data(ttl=1800, show_spinner=False)
+def fetch_all_prices() -> tuple:
+    prices, vols = [], []
     for c in COINS:
         df = fetch_ohlcv(c)
         prices.append(df[[c]])
@@ -57,10 +62,11 @@ def fetch_all_prices() -> tuple[pd.DataFrame, pd.DataFrame]:
     vol_df = pd.concat(vols, axis=1)
     return price_df, vol_df
 
-@st.cache_data(ttl=900)
+@st.cache_data(ttl=900, show_spinner=False)
 def fetch_news() -> pd.DataFrame:
+    """Fetch recent crypto news (EN) from CryptoCompare."""
     url = "https://min-api.cryptocompare.com/data/v2/news/"
-    params = {"lang": "EN", "api_key": CRYPTOCOMPARE_API_KEY}
+    params = _add_api_key({"lang": "EN"})
     r = requests.get(url, params=params, timeout=30)
     r.raise_for_status()
     data = r.json().get("Data", [])
@@ -77,10 +83,10 @@ def fetch_news() -> pd.DataFrame:
     return df
 
 def compute_returns(price_df: pd.DataFrame) -> pd.DataFrame:
-    return np.log(price_df[COINS] / price_df[COINS].shift(1)).dropna()
+    return np.log(price_df[COINS] / price_df[COINS].shift(1)).dropna(how="any")
 
-def score_sentiment(news_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series]:
-    """VADER 对新闻打分，产出逐日 CSSI（7日平滑）与 MSI。"""
+def score_sentiment(news_df: pd.DataFrame) -> tuple:
+    """VADER on news -> daily CSSI (7D smooth) and MSI."""
     if news_df.empty:
         empty_idx = pd.Index([], dtype="datetime64[ns, UTC]")
         return pd.DataFrame(index=empty_idx, columns=COINS).fillna(0.0), pd.Series(0.0, index=empty_idx)
@@ -90,12 +96,12 @@ def score_sentiment(news_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series]:
     news_df["date"] = news_df["published_on"].dt.floor("D")
     all_dates = sorted(news_df["date"].unique())
 
-    cssi = {}
     patterns = {
         "BTC": r"\b(btc|bitcoin|btc/usd)\b",
         "ADA": r"\b(ada|cardano|ada/usd)\b",
         "XRP": r"\b(xrp|ripple|xrp/usd)\b",
     }
+    cssi = {}
     for coin in COINS:
         sub = news_df[news_df["text"].str.contains(patterns[coin], regex=True, na=False)]
         daily = {}
@@ -104,7 +110,7 @@ def score_sentiment(news_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series]:
             daily[d] = float(np.mean(comp)) if comp else 0.0
         s = pd.Series(daily)
         s = s.reindex(all_dates).fillna(0.0)
-        s = s.rolling(SMOOTH_DAYS, min_periods=1).mean()
+        s = s.rolling(SMOOTH_DAYS, min_periods=1).mean()  # 7-day smoothing
         cssi[coin] = s
 
     cssi_df = pd.DataFrame(cssi).fillna(0.0)
@@ -113,39 +119,49 @@ def score_sentiment(news_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series]:
 
 def optimize_portfolio(
     returns_df: pd.DataFrame,
-    cssi_now: dict[str, float],
+    cssi_now: dict,
     model: str = "MVO",
     sentiment_tilt: bool = True,
     alpha: float = 0.02,
-) -> dict[str, float]:
-    """MVO / MinVar /（ERC 简化为等权）。约束：sum w=1，0<=w<=MAX_WEIGHT"""
+) -> dict:
+    """MVO / MinVar / (ERC simplified to EW). Constraints: sum w=1, 0<=w<=MAX_WEIGHT."""
     cols = [c for c in COINS if c in returns_df.columns]
     if len(cols) < 2:
         return {c: 1/len(COINS) for c in COINS}
 
-    mu = returns_df[cols].mean().values
-    Sigma = returns_df[cols].cov().values
+    # Mean & covariance (robust)
+    mu = returns_df[cols].mean().to_numpy()
+    Sigma = returns_df[cols].cov().to_numpy()
+    Sigma = np.nan_to_num(Sigma, nan=0.0, posinf=0.0, neginf=0.0)
+    Sigma = 0.5 * (Sigma + Sigma.T)
+    Sigma += np.eye(Sigma.shape[0]) * 1e-6
+    P = cp.psd_wrap(Sigma)
 
+    # Sentiment return tilt
     if sentiment_tilt:
         mu = mu + alpha * np.array([cssi_now.get(c, 0.0) for c in cols])
 
-    # 变量与约束
+    # Variable & constraints
     w = cp.Variable(len(cols))
     constraints = [cp.sum(w) == 1, w >= 0, w <= MAX_WEIGHT]
 
+    # Objective
     if model == "MVO":
-        objective = cp.Maximize(mu @ w - 1.0 * cp.quad_form(w, Sigma))
+        objective = cp.Maximize(mu @ w - 1.0 * cp.quad_form(w, P))
     elif model == "MinVar":
-        objective = cp.Minimize(cp.quad_form(w, Sigma))
+        objective = cp.Minimize(cp.quad_form(w, P))
     else:
-        # ERC 简化：等权
         eq = {c: 1/len(cols) for c in cols}
         return {c: eq.get(c, 0.0) for c in COINS}
 
     prob = cp.Problem(objective, constraints)
     try:
-        prob.solve()  # 让 cvxpy 自动选择可用求解器
-        if w.value is None:
+        try:
+            prob.solve(solver=cp.OSQP, verbose=False)
+        except Exception:
+            prob.solve(verbose=False)
+
+        if (w.value is None) or (not np.all(np.isfinite(w.value))):
             raise RuntimeError("Optimization failed")
         core = {cols[i]: float(w.value[i]) for i in range(len(cols))}
     except Exception:
@@ -195,15 +211,28 @@ st.sidebar.caption(f"Max weight per asset: {int(MAX_WEIGHT*100)}%")
 # ------------------------------ #
 st.title("📈 Sentiment-Enhanced Crypto Portfolio (BTC / ADA / XRP)")
 
+# Fetch market data
 with st.spinner("Fetching market data…"):
-    price_df, vol_df = fetch_all_prices()
+    try:
+        price_df, vol_df = fetch_all_prices()
+    except Exception as e:
+        st.error(f"Failed to fetch OHLCV data: {e}")
+        st.stop()
+
 returns_df = compute_returns(price_df)
 
+# Fetch news & build sentiment
 with st.spinner("Fetching news and computing sentiment…"):
-    news_df = fetch_news()
-    cssi_df, msi_ser = score_sentiment(news_df)
+    try:
+        news_df = fetch_news()
+        cssi_df, msi_ser = score_sentiment(news_df)
+    except Exception as e:
+        st.warning(f"News sentiment unavailable: {e}")
+        # Use zero sentiment if news fails
+        cssi_df = pd.DataFrame(index=returns_df.index, columns=COINS).fillna(0.0)
+        msi_ser = pd.Series(0.0, index=returns_df.index)
 
-# 对齐索引（以价格为准）
+# Align indices
 common_idx = price_df.index
 if not cssi_df.empty:
     common_idx = common_idx.intersection(cssi_df.index)
@@ -211,19 +240,19 @@ if not msi_ser.empty:
     common_idx = common_idx.intersection(msi_ser.index)
 
 price_df = price_df.reindex(common_idx)
-returns_df = returns_df.reindex(common_idx).dropna()
+returns_df = returns_df.reindex(common_idx).dropna(how="any")
 cssi_df = cssi_df.reindex(common_idx).fillna(0.0)
 msi_ser = msi_ser.reindex(common_idx).fillna(0.0)
 
-# 取最新 CSSI / MSI
+# Latest CSSI/MSI
 if not cssi_df.empty:
-    cssi_latest_series = cssi_df.iloc[-1]
-    cssi_latest = {c: float(cssi_latest_series.get(c, 0.0)) for c in COINS}
+    last_cssi = cssi_df.iloc[-1]
+    cssi_latest = {c: float(last_cssi.get(c, 0.0)) for c in COINS}
 else:
     cssi_latest = {c: 0.0 for c in COINS}
 msi_latest = float(msi_ser.iloc[-1]) if not msi_ser.empty else 0.0
 
-# 组合优化
+# Optimize
 weights = optimize_portfolio(
     returns_df=returns_df,
     cssi_now=cssi_latest,
@@ -240,7 +269,6 @@ tab1, tab2, tab3 = st.tabs(["Portfolio", "Sentiment", "Market"])
 with tab1:
     st.subheader("Current Portfolio Weights")
     weights_df = pd.DataFrame.from_dict(weights, orient="index", columns=["Weight"]).sort_index()
-    # 显示百分比（用新列避免链式格式化带来的括号嵌套）
     weights_view = (weights_df * 100).round(2).astype(str) + "%"
     st.dataframe(weights_view, use_container_width=True)
 
@@ -268,7 +296,6 @@ with tab1:
 with tab2:
     st.subheader("Sentiment Indices")
     if not cssi_df.empty:
-        # 清理时区方便作图
         cssi_plot = cssi_df.copy()
         try:
             cssi_plot.index = cssi_plot.index.tz_convert(None)
@@ -290,7 +317,10 @@ with tab2:
     st.subheader("Recent News")
     if not news_df.empty:
         show_cols = ["published_on", "title", "url", "source", "tags"]
-        st.dataframe(news_df[show_cols].sort_values("published_on", ascending=False).head(50), use_container_width=True)
+        st.dataframe(
+            news_df[show_cols].sort_values("published_on", ascending=False).head(50),
+            use_container_width=True
+        )
     else:
         st.info("No news pulled from API.")
 
