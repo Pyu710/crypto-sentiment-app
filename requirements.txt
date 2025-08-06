@@ -6,3 +6,4 @@ cvxpy
 pandas
 numpy
 scikit-learn
+osqp
