@@ -1,0 +1,8 @@
+streamlit
+plotly
+vaderSentiment
+requests
+cvxpy
+pandas
+numpy
+scikit-learn
