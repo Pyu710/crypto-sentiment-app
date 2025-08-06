@@ -44,17 +44,17 @@ def _ensure_min_rows(df: pd.DataFrame, min_rows: int) -> bool:
 def _generate_fallback_prices(days=FALLBACK_DAYS) -> pd.DataFrame:
     """几何随机游走价格，保证 Market 页有图"""
     np.random.seed(RNG_SEED)
-    idx = pd.date_range(end=pd.Timestamp.utcnow(), periods=days, freq="D")
+    idx = pd.date_range(end=pd.Timestamp.now(tz="UTC"), periods=days, freq="D", tz="UTC")
     prices = {}
     for c, start in zip(COINS, [60000, 0.5, 0.6]):
         rets = np.random.normal(loc=0.0005, scale=0.03, size=days)  # 日收益
         prices[c] = start * np.exp(np.cumsum(rets))
-    return pd.DataFrame(prices, index=idx.tz_localize("UTC"))
+    return pd.DataFrame(prices, index=idx)
 
 def _generate_fallback_sentiment(days=FALLBACK_DAYS) -> tuple[pd.DataFrame, pd.Series]:
     """平滑噪声/正弦混合的 CSSI/MSI，保证 Sentiment 页有图"""
     np.random.seed(RNG_SEED + 7)
-    idx = pd.date_range(end=pd.Timestamp.utcnow(), periods=days, freq="D").tz_localize("UTC")
+    idx = pd.date_range(end=pd.Timestamp.now(tz="UTC"), periods=days, freq="D", tz="UTC")
     cssi = {}
     phases = [0.0, 1.0, 2.0]
     for coin, ph in zip(COINS, phases):
@@ -119,7 +119,7 @@ def fetch_all_prices() -> tuple[pd.DataFrame, pd.DataFrame]:
 def fetch_news(days: int = NEWS_LOOKBACK_DAYS, max_batches: int = MAX_NEWS_BATCHES) -> pd.DataFrame:
     """回溯抓取最近 N 天新闻；失败返回空表（不影响图表渲染）"""
     url = "https://min-api.cryptocompare.com/data/v2/news/"
-    start_ts = int((pd.Timestamp.utcnow() - pd.Timedelta(days=days)).timestamp())
+    start_ts = int((pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=days)).timestamp())
     all_rows, lts, batches = [], None, 0
     while batches < max_batches:
         params = {"lang": "EN", "lTs": lts if lts is not None else start_ts}
@@ -149,7 +149,7 @@ def fetch_news(days: int = NEWS_LOOKBACK_DAYS, max_batches: int = MAX_NEWS_BATCH
     df = df[["title", "body", "published_on", "url", "source", "tags"]].copy()
     df = df.drop_duplicates(subset=["title", "published_on"], keep="first")
     df["published_on"] = pd.to_datetime(df["published_on"], unit="s", utc=True)
-    cutoff = pd.Timestamp.utcnow().tz_localize("UTC") - pd.Timedelta(days=days)
+    cutoff = pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=days)
     df = df[df["published_on"] >= cutoff]
     return df.sort_values("published_on").reset_index(drop=True)
 
@@ -254,7 +254,6 @@ def call_gemini(portfolio: dict, cssi_now: dict, msi_now: float) -> str:
 # ========================
 def resample_weekly_prices(price_df: pd.DataFrame) -> pd.DataFrame:
     wk = price_df[COINS].resample("W-FRI").last()
-    # 若有缺口，线性插值并前后填充
     wk = wk.interpolate().ffill().bfill()
     return wk
 
@@ -272,35 +271,28 @@ def weekly_backtest(
     """
     周频回测：
     - 每周末（W-FRI）用过去 lookback_weeks 的周收益估计 mu/Sigma
-    - CSSI/MSI 取该周末的值（CSSI 已日内7日平滑）
+    - CSSI/MSI 取该周末的值
     - 本周开盘调仓 -> 本周净值用新权重，扣除换手成本
     """
-    # 周价格与收益
     wk_px = resample_weekly_prices(price_df)
     wk_ret = wk_px.pct_change().dropna()
     if wk_ret.shape[0] < max(lookback_weeks + 2, 4):
-        # 数据太少，返回空
-        return {"curve": pd.Series(dtype=float), "table": pd.DataFrame(), "turnover": [], "costs": []}
+        return {"curve": pd.Series(dtype=float), "stats": pd.DataFrame(), "rets": pd.Series(dtype=float), "trades": pd.DataFrame()}
 
-    # 周 CSSI/MSI 对齐到周频
     wk_cssi = cssi_df.resample("W-FRI").last().reindex(wk_ret.index).ffill().fillna(0.0)
     wk_msi = msi_ser.resample("W-FRI").last().reindex(wk_ret.index).ffill().fillna(0.0)
 
-    # 回测主循环
     idx = wk_ret.index
     n = len(idx)
     ew = np.array([1.0/len(COINS)]*len(COINS))
     w_prev = ew.copy()
     curve = [1.0]
     rets = []
-    turnovers, costs = [], []
     rows = []
-
     cost_rate = commission + slippage
 
     for i in range(n):
         date_i = idx[i]
-        # 用过去 lookback_weeks 的周收益来估计参数（避免前瞻）
         if i < lookback_weeks:
             w_now = ew.copy()
         else:
@@ -309,7 +301,6 @@ def weekly_backtest(
             w_now = optimize_portfolio(hist, cssi_now, model=model, sentiment_tilt=sentiment_tilt, alpha=alpha)
             w_now = np.array([w_now.get(c, 0.0) for c in COINS])
 
-        # 本周收益用“本周资产收益 * 本周权重”，并在调仓时收取成本
         r_vec = wk_ret.iloc[i].to_numpy()
         turnover = float(np.sum(np.abs(w_now - w_prev)))
         cost = turnover * cost_rate
@@ -317,9 +308,6 @@ def weekly_backtest(
         r_net = r_gross - cost
 
         rets.append(r_net)
-        turnovers.append(turnover)
-        costs.append(cost)
-
         curve.append(curve[-1] * (1.0 + r_net))
         w_prev = w_now.copy()
 
@@ -337,7 +325,6 @@ def weekly_backtest(
     rets = pd.Series(rets, index=idx, name="weekly_net_return")
     trades = pd.DataFrame(rows).set_index("date")
 
-    # 计算指标
     weeks = len(rets)
     if weeks > 1:
         ann_return = (1 + rets).prod() ** (52/weeks) - 1
@@ -346,8 +333,8 @@ def weekly_backtest(
         cum = (1 + rets).cumprod()
         peak = cum.cummax()
         mdd = (cum/peak - 1).min()
-        avg_turnover = np.mean(turnovers)
-        avg_cost = np.mean(costs)
+        avg_turnover = trades["turnover"].mean()
+        avg_cost = trades["cost"].mean()
     else:
         ann_return = ann_vol = sharpe = mdd = avg_turnover = avg_cost = np.nan
 
@@ -359,14 +346,7 @@ def weekly_backtest(
         "Avg Weekly Turnover": [avg_turnover],
         "Avg Weekly Cost Drag": [avg_cost],
     })
-    return {
-        "curve": curve,
-        "stats": table,
-        "rets": rets,
-        "trades": trades,
-        "turnover": turnovers,
-        "costs": costs,
-    }
+    return {"curve": curve, "stats": table, "rets": rets, "trades": trades}
 
 # ========================
 # Sidebar
@@ -474,21 +454,19 @@ with tab2:
                     use_container_width=True)
 
     st.subheader("ΔCSSI Heatmap (Daily change)")
-    delta_cssi = cssi_df.diff().tail(180)  # 近 180 天
+    delta_cssi = cssi_df.diff().tail(180)
     if not delta_cssi.empty:
         delta_plot = delta_cssi.copy()
         try:
             delta_plot.index = delta_plot.index.tz_convert(None)
         except Exception:
             pass
-        # 为了更好的色带中心，限制到 [-0.5, 0.5]
-        zmin, zmax = -0.5, 0.5
         hm = px.imshow(
             delta_plot.T,
             aspect="auto",
             origin="lower",
             title="ΔCSSI Heatmap (last 180 days)",
-            zmin=zmin, zmax=zmax,
+            zmin=-0.5, zmax=0.5,
         )
         st.plotly_chart(hm, use_container_width=True)
     else:
@@ -518,13 +496,11 @@ with tab4:
     st.subheader("Weekly Backtest (Net of costs)")
     curve = bt["curve"]
     stats = bt["stats"]
-    rets = bt["rets"]
     trades = bt["trades"]
 
     if curve.empty:
         st.info("回测数据不足，请尝试降低 lookback 或等待更多历史。")
     else:
-        # 累计收益曲线
         curve_plot = curve.copy()
         try:
             curve_plot.index = curve_plot.index.tz_convert(None)
@@ -533,7 +509,6 @@ with tab4:
         st.plotly_chart(px.line(curve_plot, title="Cumulative Return (Weekly, net)"),
                         use_container_width=True)
 
-        # 指标表
         if not stats.empty:
             st.subheader("Performance Metrics")
             fmt = {
@@ -550,7 +525,6 @@ with tab4:
                     stats_view[c] = stats_view[c].apply(lambda x: f(x) if pd.notnull(x) else "NA")
             st.table(stats_view)
 
-        # 交易/权重与成本概览（近 10 周）
         if not trades.empty:
             st.subheader("Recent Rebalances (last 10 weeks)")
             show_cols = ["gross_return", "net_return", "turnover", "cost", "MSI"] + [f"w_{c}" for c in COINS]
@@ -577,3 +551,5 @@ with st.expander("🔧 Diagnostics"):
         "cssi_df": cssi_df.shape if not cssi_df.empty else None,
         "msi_len": len(msi_ser) if not msi_ser.empty else 0
     })
+    st.write("Latest CSSI:", cssi_df.iloc[-1].to_dict() if not cssi_df.empty else {})
+    st.write("Latest MSI:", float(msi_ser.iloc[-1]) if not msi_ser.empty else None)
