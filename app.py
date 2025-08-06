@@ -336,3 +336,24 @@ with tab3:
         st.plotly_chart(fig_px, use_container_width=True)
     else:
         st.info("Price data not available.")
+# ========== Diagnostics Tab ==========
+with st.expander("🔧 Diagnostics (for debugging)"):
+    st.write("Environment keys present?", {
+        "CRYPTOCOMPARE_API_KEY": bool(CRYPTOCOMPARE_API_KEY),
+        "GEMINI_API_KEY": bool(GEMINI_API_KEY)
+    })
+    st.write("Data shapes:", {
+        "price_df": price_df[COINS].shape if not price_df.empty else None,
+        "returns_df": returns_df.shape if not returns_df.empty else None,
+        "cssi_df": cssi_df.shape if not cssi_df.empty else None,
+        "msi_len": len(msi_ser) if not msi_ser.empty else 0
+    })
+    st.write("Latest CSSI:", cssi_latest)
+    st.write("Latest MSI:", msi_latest)
+    st.write("Weights:", weights)
+    st.write("News rows (head 3):")
+    if not news_df.empty:
+        st.dataframe(news_df.head(3))
+    else:
+        st.write("No news data fetched.")
+
