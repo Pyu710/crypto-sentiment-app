@@ -60,21 +60,74 @@ def fetch_all_prices():
     return pd.concat(prices, axis=1), pd.concat(vols, axis=1)
 
 @st.cache_data(ttl=900)
-def fetch_news():
+def fetch_news(days: int = NEWS_LOOKBACK_DAYS,
+               max_batches: int = MAX_NEWS_BATCHES) -> pd.DataFrame:
+    """
+    抓取过去 N 天的 CryptoCompare 英文新闻，带回溯。
+    - 使用 lTs (lower timestamp) 参数回溯历史
+    - 批量拉取并合并去重
+    - 返回统一列：title, body, published_on, url, source, tags
+    """
     url = "https://min-api.cryptocompare.com/data/v2/news/"
-    params = _add_api_key({"lang": "EN"})
-    r = requests.get(url, params=params, timeout=30)
-    r.raise_for_status()
-    data = r.json().get("Data", [])
-    if not data:
+    # 起始时间戳：N天前（UTC）
+    start_ts = int((pd.Timestamp.utcnow() - pd.Timedelta(days=days)).timestamp())
+
+    all_rows = []
+    lts = None  # 本批次下限时间（往过去移动）
+    batches = 0
+
+    while batches < max_batches:
+        params = {"lang": "EN"}
+        if CRYPTOCOMPARE_API_KEY:
+            params["api_key"] = CRYPTOCOMPARE_API_KEY
+        # 首批从 N 天前开始，后续用上一批最早时间继续回溯
+        params["lTs"] = lts if lts is not None else start_ts
+
+        r = requests.get(url, params=params, timeout=30)
+        r.raise_for_status()
+        data = r.json().get("Data", [])
+
+        if not data:
+            break
+
+        # 累积
+        all_rows.extend(data)
+        batches += 1
+
+        # 找到这一批里最早一条新闻的时间，作为下一批的 lTs 下限，继续向过去拉
+        # published_on 为秒级时间戳
+        oldest = min([row.get("published_on", 0) for row in data if "published_on" in row], default=None)
+        if oldest is None:
+            break
+        # 若最早时间已经早于 start_ts 很多，可以停止
+        if oldest <= start_ts:
+            break
+        # 下一批继续从更早开始
+        lts = oldest - 1
+
+    if not all_rows:
         return pd.DataFrame(columns=["title", "body", "published_on", "url", "source", "tags"])
-    df = pd.DataFrame(data)
+
+    df = pd.DataFrame(all_rows)
+
+    # 统一列
     for col in ["title", "body", "published_on", "url", "source", "tags"]:
         if col not in df.columns:
             df[col] = None
-    df = df[["title", "body", "published_on", "url", "source", "tags"]]
+    df = df[["title", "body", "published_on", "url", "source", "tags"]].copy()
+
+    # 去重（按标题+时间去重，避免分页重复）
+    df = df.drop_duplicates(subset=["title", "published_on"], keep="first")
+
+    # 时间处理 & 过滤到最近 N 天
     df["published_on"] = pd.to_datetime(df["published_on"], unit="s", utc=True)
-    return df.sort_values("published_on").reset_index(drop=True)
+    cutoff = pd.Timestamp.utcnow().tz_localize("UTC") - pd.Timedelta(days=days)
+    df = df[df["published_on"] >= cutoff]
+
+    # 排序
+    df = df.sort_values("published_on").reset_index(drop=True)
+    return df
+
 
 def compute_returns(price_df):
     return np.log(price_df[COINS] / price_df[COINS].shift(1)).dropna()
@@ -235,3 +288,4 @@ with tab3:
         st.plotly_chart(px.line(price_df[COINS], title="Close Prices"), use_container_width=True)
     else:
         st.info("价格数据不足，无法绘制曲线。")
+
